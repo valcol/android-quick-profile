@@ -51,10 +51,9 @@ const updateInfos = (dataset, entriesToAdds, extraDatas = {}) => {
 const presice = (n) => Number.parseFloat(n).toFixed(2);
 const formatOutput = (...args) => args.reduce((t, arg) => `${t}\n${arg}`);
 const formatTitle = (title) => title;
-const formatAggregates = ({ min, max, average }) => ` MIN: ${presice(min)}   MAX: ${presice(max)}   AVERAGE: ${presice(
+const formatAggregates = ({ min, max, average }, unit) => ` MIN: ${presice(min)}${unit}   MAX: ${presice(max)}${unit}   AVERAGE: ${presice(
   average,
-)} `;
-const formatExtras = (extras) => Object.entries(extras).reduce((acc, [key, value]) => `${acc}${key}: ${value}\n`, '');
+)}${unit} `;
 
 let frames = { ...getInitialInfos(), jankyFrames: 0 };
 let memory = getInitialInfos();
@@ -151,7 +150,7 @@ const draw = async (deviceId, packageName, pid) => {
       getSysInfos(deviceId, pid);
       logUpdate(
         formatOutput(
-          chalk.inverse.magenta(formatTitle(' FRAMES ')),
+          chalk.inverse.magenta(formatTitle(' FRAMES (frame timing - ms)')),
           chalk.magenta(
             asciichart.plot(
               [
@@ -171,24 +170,25 @@ const draw = async (deviceId, packageName, pid) => {
               },
             ),
           ),
-          chalk.inverse.magenta(formatAggregates(frames)),
-          chalk.inverse.magenta(formatExtras({ 'Frames rendered': frames.nbOfEntries, 'Janky frames': `${frames.jankyFrames} (${presice((frames.jankyFrames * 100) / frames.nbOfEntries)}%)` })),
+          chalk.inverse.magenta(formatAggregates(frames, 'ms')),
+          chalk.magenta(`Frames rendered: ${frames.nbOfEntries}`),
+          chalk.magenta(`Janky frames': ${frames.jankyFrames} (${presice((frames.jankyFrames * 100) / frames.nbOfEntries)}%)`),
           ' ',
-          chalk.inverse.blue(formatTitle(' MEMORY ')),
+          chalk.inverse.blue(formatTitle(' MEMORY (use - MB)')),
           chalk.blue(
             asciichart.plot([memory.entries, [0, 0], [10, 10]], {
               height: 10,
             }),
           ),
-          chalk.inverse.blue(formatAggregates(memory)),
+          chalk.inverse.blue(formatAggregates(memory, 'MB')),
           ' ',
-          chalk.inverse.cyan(formatTitle(' CPU ')),
+          chalk.inverse.cyan(formatTitle(' CPU (use - %thread)')),
           chalk.cyan(
             asciichart.plot([cpu.entries, [0, 0], [10, 10]], {
               height: 10,
             }),
           ),
-          chalk.inverse.cyan(formatAggregates(cpu)),
+          chalk.inverse.cyan(formatAggregates(cpu, '%')),
         ),
       );
     } catch (e) {
