@@ -17,13 +17,17 @@ const histogramRanges = [0, 16.66, 33.33, 50, 100, 200, 300, 400, 500, 1000];
 
 const formatHistogramRanges = (range) => `More than ${range}ms`;
 
-let frames = {
+const baseDatasetValues = {
   entries: new Array(120).fill(0),
   min: Number.MAX_SAFE_INTEGER,
   max: Number.MIN_SAFE_INTEGER,
   average: 0,
   total: 0,
   nbOfEntries: 0,
+};
+
+let frames = {
+  ...baseDatasetValues,
   jankyFrames: 0,
   histogram: histogramRanges.reduce((acc, range) => ({
     ...acc,
@@ -63,21 +67,28 @@ const updateInfos = (dataset, entriesToAdds, jankyFramesToAdd, histogramToAdd) =
 };
 
 const waitForProcessToStart = async (deviceId, packageName) => {
-  const output = await client
-    .shell(deviceId, `ps | grep -e "${packageName}"`)
+  const process = await client
+    .shell(deviceId, 'ps && ps -A')
     .then(adb.util.readAll);
-  if (!output.toString('utf-8')) {
+  const regex = RegExp(
+    `${packageName}`,
+  );
+  const wantedProcess = regex.exec(process.toString('utf-8'));
+  if (!wantedProcess) {
     await sleep(200);
-    waitForProcessToStart(deviceId, packageName);
-    return;
+    return waitForProcessToStart(deviceId, packageName);
   }
   console.log(chalk.green('App started.'));
+  return true;
 };
 
 const updateFrameInfos = (renderTimings) => {
-  const jankyFrames = renderTimings.reduce((acc, timing) => (timing > 16.67 ? acc + 1 : acc), 0);
+  const filteredRenderTimings = renderTimings.filter((t) => !Number.isNaN(t));
+  if (filteredRenderTimings.length === 0) return;
+
+  const jankyFrames = filteredRenderTimings.reduce((acc, timing) => (timing > 16.67 ? acc + 1 : acc), 0);
   const bin = d3Array.bin().thresholds(histogramRanges);
-  const bins = bin(renderTimings);
+  const bins = bin(filteredRenderTimings);
   const histogram = bins.reduce((acc, h) => {
     if (!histogramRanges.includes(h.x0)) {
       return {
@@ -90,17 +101,20 @@ const updateFrameInfos = (renderTimings) => {
       [formatHistogramRanges(h.x0)]: h.length,
     };
   }, {});
-  frames = updateInfos(frames, renderTimings, jankyFrames, histogram);
+  frames = updateInfos(frames, filteredRenderTimings, jankyFrames, histogram);
 };
 
 const getFramesInfosAndroidJL = async (dumpsysOutput, regex) => {
   const profiledataRegex = RegExp(regex);
   const profiledata = profiledataRegex.exec(dumpsysOutput);
+  if (!profiledata) return;
+
   const profiledataJson = await csv({ delimiter: '\t', ignoreEmpty: true, headers: profiledata[1].split('\t') }).fromString(profiledata[2]);
   const renderTimings = profiledataJson.map(
     (data) => Object.values(data).reduce((acc, n) => acc + parseFloat(n), 0),
   );
   if (renderTimings.length === 0) return;
+
   updateFrameInfos(renderTimings);
 };
 
@@ -185,15 +199,17 @@ const askForPackageName = async (deviceId) => {
 };
 
 const draw = async (deviceId, packageName, APILevel) => {
+  const start = Date.now();
   setInterval(() => {
     try {
       getFramesInfos(deviceId, packageName, APILevel);
       const {
         entries, min, max, average, nbOfEntries, jankyFrames, histogram,
       } = frames;
-
       logUpdate(
         formatOutput(
+          chalk(`Running for ${new Date(Date.now() - start).toISOString().slice(11, -1)}`),
+          '',
           chalk.inverse.magenta(' LIVE FRAME TIMINGS ( last 120 frames - ms) '),
           '',
           chalk.magenta(
