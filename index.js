@@ -7,32 +7,46 @@ const adb = require('adbkit');
 const chalk = require('chalk');
 const inquirer = require('inquirer');
 const logoCli = require('cli-logo');
+const d3Array = require('d3-array');
+const bars = require('bars');
 const sleep = require('util').promisify(setTimeout);
 const { description, version } = require('./package.json');
 
 const client = adb.createClient();
+const histogramRanges = [0, 16.66, 33.33, 50, 100, 200, 300, 400, 500, 1000];
 
-const getInitialInfos = () => ({
+const formatHistogramRanges = (range) => `More than ${range}ms`;
+
+let frames = {
   entries: new Array(120).fill(0),
   min: Number.MAX_SAFE_INTEGER,
   max: Number.MIN_SAFE_INTEGER,
   average: 0,
   total: 0,
   nbOfEntries: 0,
-});
+  jankyFrames: 0,
+  histogram: histogramRanges.reduce((acc, range) => ({
+    ...acc,
+    [formatHistogramRanges(range)]: 0,
+  }), {}),
+};
 
-const updateInfos = (dataset, entriesToAdds, extraDatas = {}) => {
+const presice = (n) => Number.parseFloat(n).toFixed(2);
+
+const formatOutput = (...args) => args.reduce((t, arg) => `${t}\n${arg}`, '');
+
+const updateInfos = (dataset, entriesToAdds, jankyFramesToAdd, histogramToAdd) => {
   const {
-    entries, min, max, average, total, nbOfEntries, ...extras
+    entries, min, max, total, nbOfEntries, jankyFrames, histogram,
   } = dataset;
 
   const updatedNbOfEntries = nbOfEntries + entriesToAdds.length;
-  const updatedTotal = total + entriesToAdds.reduce((t, n) => t + n);
-  const newExtras = Object.entries(extraDatas).reduce((acc, [key, value]) => ((extras[key]) ? {
+  const updatedTotal = total + entriesToAdds.reduce((t, n) => t + n, 0);
+  const mergedHistogram = Object.entries(histogramToAdd).reduce((acc, [key, value]) => ((acc[key]) ? {
     ...acc,
-    [key]: extras[key] + value,
+    [key]: acc[key] + value,
   } : { ...acc, [key]: value }),
-  {});
+  histogram);
   return {
     entries: [
       ...entriesToAdds,
@@ -43,42 +57,58 @@ const updateInfos = (dataset, entriesToAdds, extraDatas = {}) => {
     average: updatedTotal / updatedNbOfEntries,
     total: updatedTotal,
     nbOfEntries: updatedNbOfEntries,
-    ...newExtras,
+    jankyFrames: jankyFrames + jankyFramesToAdd,
+    histogram: mergedHistogram,
   };
 };
 
-
-const presice = (n) => Number.parseFloat(n).toFixed(2);
-const formatOutput = (...args) => args.reduce((t, arg) => `${t}\n${arg}`);
-const formatTitle = (title) => title;
-const formatAggregates = ({ min, max, average }, unit) => ` MIN: ${presice(min)}${unit}   MAX: ${presice(max)}${unit}   AVERAGE: ${presice(
-  average,
-)}${unit} `;
-
-let frames = { ...getInitialInfos(), jankyFrames: 0 };
-let memory = getInitialInfos();
-let cpu = getInitialInfos();
-
-const getPid = async (deviceId, packageName) => {
+const waitForProcessToStart = async (deviceId, packageName) => {
   const output = await client
-    .shell(deviceId, `pidof ${packageName}`)
+    .shell(deviceId, `ps | grep -e "${packageName}"`)
     .then(adb.util.readAll);
   if (!output.toString('utf-8')) {
     await sleep(200);
-    return getPid(deviceId, packageName);
+    waitForProcessToStart(deviceId, packageName);
+    return;
   }
   console.log(chalk.green('App started.'));
-  return parseInt(output, 10);
 };
 
-const getFramesInfos = async (deviceId, packageName) => {
-  const output = await client
-    .shell(deviceId, `dumpsys gfxinfo ${packageName} framestats reset`)
-    .then(adb.util.readAll);
-  const profiledata = RegExp(
+const updateFrameInfos = (renderTimings) => {
+  const jankyFrames = renderTimings.reduce((acc, timing) => (timing > 16.67 ? acc + 1 : acc), 0);
+  const bin = d3Array.bin().thresholds(histogramRanges);
+  const bins = bin(renderTimings);
+  const histogram = bins.reduce((acc, h) => {
+    if (!histogramRanges.includes(h.x0)) {
+      return {
+        ...acc,
+        [formatHistogramRanges(0)]: h.length,
+      };
+    }
+    return {
+      ...acc,
+      [formatHistogramRanges(h.x0)]: h.length,
+    };
+  }, {});
+  frames = updateInfos(frames, renderTimings, jankyFrames, histogram);
+};
+
+const getFramesInfosAndroidJL = async (dumpsysOutput, regex) => {
+  const profiledataRegex = RegExp(regex);
+  const profiledata = profiledataRegex.exec(dumpsysOutput);
+  const profiledataJson = await csv({ delimiter: '\t', ignoreEmpty: true, headers: profiledata[1].split('\t') }).fromString(profiledata[2]);
+  const renderTimings = profiledataJson.map(
+    (data) => Object.values(data).reduce((acc, n) => acc + parseFloat(n), 0),
+  );
+  if (renderTimings.length === 0) return;
+  updateFrameInfos(renderTimings);
+};
+
+const getFramesInfosAndroidM = async (dumpsysOutput) => {
+  const profiledataRegex = RegExp(
     '(?<=---PROFILEDATA---\n)(.|\n)*?(?=---PROFILEDATA---)',
-    'g',
-  ).exec(output.toString('utf-8'));
+  );
+  const profiledata = profiledataRegex.exec(dumpsysOutput);
   if (!profiledata || !profiledata[0]) return;
 
   const profiledataJson = await csv().fromString(profiledata[0]);
@@ -91,20 +121,31 @@ const getFramesInfos = async (deviceId, packageName) => {
       return renderTimeInMS;
     },
   );
-  const jankyFrames = renderTimings.reduce((acc, timing) => (timing > 16.67 ? acc + 1 : acc), 0);
-  frames = updateInfos(frames, renderTimings, { jankyFrames });
+  updateFrameInfos(renderTimings);
 };
 
-const getSysInfos = async (deviceId, pid) => {
-  const output = await client
-    .shell(deviceId, `top -b -n 1 -p ${pid} | tail -n 1`)
+
+const getFramesInfos = async (deviceId, packageName, APILevel) => {
+  const dumpsysOutput = await client
+    .shell(deviceId, `dumpsys gfxinfo ${packageName} framestats reset`)
     .then(adb.util.readAll);
-  const profiledata = output
-    .toString('utf-8')
-    .replace(/\s\s+/g, ' ')
-    .split(' ').filter((data) => data !== '');
-  memory = updateInfos(memory, [parseInt(profiledata[6], 10)]);
-  cpu = updateInfos(cpu, [parseInt(profiledata[8], 10)]);
+  if (APILevel >= 21) {
+    getFramesInfosAndroidM(dumpsysOutput.toString());
+  } else if (APILevel >= 20) {
+    getFramesInfosAndroidJL(dumpsysOutput.toString(), '([\\s]*?Draw[\\s]*?Prepare[\\s]*?Process[\\s]*?Execute[\\s]*?)([\\S\\s]*?)(?=View hierarchy:)');
+  } else if (APILevel >= 16) {
+    getFramesInfosAndroidJL(dumpsysOutput.toString(), '([\\s]*?Draw[\\s]*?Process[\\s]*?Execute[\\s]*?)([\\S\\s]*?)(?=View hierarchy:)');
+  } else {
+    console.log(chalk.red('API Level not supported.'));
+    process.exit();
+  }
+};
+
+const getAPILevel = async (deviceId) => {
+  const APILevel = await client
+    .shell(deviceId, 'getprop ro.build.version.sdk ')
+    .then(adb.util.readAll);
+  return parseInt(APILevel.toString(), 10);
 };
 
 const askForDevice = async () => {
@@ -143,18 +184,22 @@ const askForPackageName = async (deviceId) => {
   return packageName;
 };
 
-const draw = async (deviceId, packageName, pid) => {
+const draw = async (deviceId, packageName, APILevel) => {
   setInterval(() => {
     try {
-      getFramesInfos(deviceId, packageName);
-      getSysInfos(deviceId, pid);
+      getFramesInfos(deviceId, packageName, APILevel);
+      const {
+        entries, min, max, average, nbOfEntries, jankyFrames, histogram,
+      } = frames;
+
       logUpdate(
         formatOutput(
-          chalk.inverse.magenta(formatTitle(' FRAMES (frame timing - ms)')),
+          chalk.inverse.magenta(' LIVE FRAME TIMINGS ( last 120 frames - ms) '),
+          '',
           chalk.magenta(
             asciichart.plot(
               [
-                frames.entries,
+                entries,
                 [0, 0],
                 [16.66, 16.66],
                 [33.33, 33.33],
@@ -170,25 +215,20 @@ const draw = async (deviceId, packageName, pid) => {
               },
             ),
           ),
-          chalk.inverse.magenta(formatAggregates(frames, 'ms')),
-          chalk.magenta(`Frames rendered: ${frames.nbOfEntries}`),
-          chalk.magenta(`Janky frames': ${frames.jankyFrames} (${presice((frames.jankyFrames * 100) / frames.nbOfEntries)}%)`),
           ' ',
-          chalk.inverse.blue(formatTitle(' MEMORY (use - MB)')),
-          chalk.blue(
-            asciichart.plot([memory.entries, [0, 0], [10, 10]], {
-              height: 10,
-            }),
-          ),
-          chalk.inverse.blue(formatAggregates(memory, 'MB')),
+          chalk.inverse.cyan(' STATS '),
           ' ',
-          chalk.inverse.cyan(formatTitle(' CPU (use - %thread)')),
-          chalk.cyan(
-            asciichart.plot([cpu.entries, [0, 0], [10, 10]], {
-              height: 10,
-            }),
-          ),
-          chalk.inverse.cyan(formatAggregates(cpu, '%')),
+          chalk.cyan(`Frames rendered: ${nbOfEntries}`),
+          chalk.cyan(`Janky frames: ${jankyFrames} (${presice((jankyFrames * 100) / nbOfEntries)}%)`),
+          chalk.cyan('Render time:'),
+          chalk.cyan(` Max: ${presice(max)}ms`),
+          chalk.cyan(` Min: ${presice(min)}ms`),
+          chalk.cyan(` Avg: ${presice(average)}ms`),
+          ' ',
+          chalk.inverse.blue(' FRAME TIMINGS DISTRIBUTION '),
+          ' ',
+          chalk.blue(bars(histogram, { sort: false })),
+          ' ',
         ),
       );
     } catch (e) {
@@ -206,8 +246,9 @@ const draw = async (deviceId, packageName, pid) => {
     version: `v${version}`,
   });
   const deviceId = await askForDevice();
+  const APILevel = await getAPILevel(deviceId);
   const packageName = await askForPackageName(deviceId);
   console.log(`Waiting for ${packageName} to start...`);
-  const pid = await getPid(deviceId, packageName);
-  draw(deviceId, packageName, pid);
+  await waitForProcessToStart(deviceId, packageName);
+  draw(deviceId, packageName, APILevel);
 })();
