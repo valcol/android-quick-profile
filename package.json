@@ -1,10 +1,14 @@
 {
   "name": "android-quick-profile",
   "version": "0.1.0",
-  "description": "A CLI profiling tool for Android ",
+  "description": "A CLI profiling tool for Android",
   "main": "index.js",
+  "keywords": ["android", "profiling", "tool", "fps", "frames", "ui", "cli"],
   "author": "valcol",
   "license": "MIT",
+  "bin": {
+    "aqp": "./index.js"
+  },
   "dependencies": {
     "adbkit": "^2.11.1",
     "asciichart": "^1.5.21",
