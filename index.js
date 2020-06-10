@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 /* eslint-disable no-console */
 /* eslint-disable no-control-regex */
 const asciichart = require('asciichart');
@@ -7,7 +9,7 @@ const adb = require('adbkit');
 const chalk = require('chalk');
 const inquirer = require('inquirer');
 const logoCli = require('cli-logo');
-const d3Array = require('d3-array');
+const d3 = require('d3-array');
 const bars = require('bars');
 const sleep = require('util').promisify(setTimeout);
 const { description, version } = require('./package.json');
@@ -39,30 +41,24 @@ const presice = (n) => Number.parseFloat(n).toFixed(2);
 
 const formatOutput = (...args) => args.reduce((t, arg) => `${t}\n${arg}`, '');
 
-const updateInfos = (dataset, entriesToAdds, jankyFramesToAdd, histogramToAdd) => {
+const computeBaseDatasetValues = (dataset, entriesToMerge) => {
   const {
-    entries, min, max, total, nbOfEntries, jankyFrames, histogram,
+    entries, min, max, total, nbOfEntries,
   } = dataset;
 
-  const updatedNbOfEntries = nbOfEntries + entriesToAdds.length;
-  const updatedTotal = total + entriesToAdds.reduce((t, n) => t + n, 0);
-  const mergedHistogram = Object.entries(histogramToAdd).reduce((acc, [key, value]) => ((acc[key]) ? {
-    ...acc,
-    [key]: acc[key] + value,
-  } : { ...acc, [key]: value }),
-  histogram);
+  const updatedNbOfEntries = nbOfEntries + entriesToMerge.length;
+  const updatedTotal = total + entriesToMerge.reduce((t, n) => t + n, 0);
+
   return {
     entries: [
-      ...entriesToAdds,
-      ...entries.slice(0, entries.length - entriesToAdds.length),
+      ...entriesToMerge,
+      ...entries.slice(0, entries.length - entriesToMerge.length),
     ],
-    min: Math.min(min, ...entriesToAdds),
-    max: Math.max(max, ...entriesToAdds),
+    min: Math.min(min, ...entriesToMerge),
+    max: Math.max(max, ...entriesToMerge),
     average: updatedTotal / updatedNbOfEntries,
     total: updatedTotal,
     nbOfEntries: updatedNbOfEntries,
-    jankyFrames: jankyFrames + jankyFramesToAdd,
-    histogram: mergedHistogram,
   };
 };
 
@@ -86,10 +82,13 @@ const updateFrameInfos = (renderTimings) => {
   const filteredRenderTimings = renderTimings.filter((t) => !Number.isNaN(t));
   if (filteredRenderTimings.length === 0) return;
 
-  const jankyFrames = filteredRenderTimings.reduce((acc, timing) => (timing > 16.67 ? acc + 1 : acc), 0);
-  const bin = d3Array.bin().thresholds(histogramRanges);
+  const {
+    jankyFrames, histogram,
+  } = frames;
+  const newJankyFrames = filteredRenderTimings.reduce((acc, timing) => (timing > 16.67 ? acc + 1 : acc), 0);
+  const bin = d3.bin().thresholds(histogramRanges);
   const bins = bin(filteredRenderTimings);
-  const histogram = bins.reduce((acc, h) => {
+  const newHistogram = bins.reduce((acc, h) => {
     if (!histogramRanges.includes(h.x0)) {
       return {
         ...acc,
@@ -101,7 +100,16 @@ const updateFrameInfos = (renderTimings) => {
       [formatHistogramRanges(h.x0)]: h.length,
     };
   }, {});
-  frames = updateInfos(frames, filteredRenderTimings, jankyFrames, histogram);
+  const mergedHistogram = Object.entries(newHistogram).reduce((acc, [key, value]) => ((acc[key]) ? {
+    ...acc,
+    [key]: acc[key] + value,
+  } : { ...acc, [key]: value }),
+  histogram);
+  frames = {
+    ...computeBaseDatasetValues(frames, filteredRenderTimings),
+    jankyFrames: jankyFrames + newJankyFrames,
+    histogram: mergedHistogram,
+  };
 };
 
 const getFramesInfosAndroidJL = async (dumpsysOutput, regex) => {
